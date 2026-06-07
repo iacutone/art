@@ -1,0 +1,17 @@
+# Generated files
+gratitude/clean_journal.pdf
+calendar/exact_match_calendar_*.pdf
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*~
