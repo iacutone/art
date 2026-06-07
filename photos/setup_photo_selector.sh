@@ -9,7 +9,7 @@ echo "🖼️  Setting up Weekly Photo Selector System..."
 
 # Create directories
 SYSTEM_DIR="$HOME/weekly-photo-selector"
-mkdir -p "$SYSTEM_DIR/selected_photos"
+mkdir -p "$SYSTEM_DIR/selections_metadata"
 mkdir -p "$SYSTEM_DIR/logs"
 
 echo "📁 Created system directories in $SYSTEM_DIR"
@@ -130,7 +130,7 @@ echo "📋 Summary:"
 echo "   • System installed in: $SYSTEM_DIR"
 echo "   • Cron job scheduled: Every Sunday at 10:00 PM EST"
 echo "   • Log files saved in: $SYSTEM_DIR/logs/"
-echo "   • Selected photos saved in: $SYSTEM_DIR/selected_photos/"
+echo "   • Selection metadata saved in: $SYSTEM_DIR/selections_metadata/"
 echo ""
 echo "🧪 To test the system manually, run:"
 echo "   $SYSTEM_DIR/test_selection.sh"

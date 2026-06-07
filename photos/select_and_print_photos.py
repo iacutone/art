@@ -27,10 +27,16 @@ PHOTO_DIRS = [
 # Try different vision-capable models in order of preference
 VISION_MODELS = ["llama3.2-vision:latest", "llava:latest", "llama3.2:latest"]
 OLLAMA_URL = "http://localhost:11434"
-OUTPUT_DIR = "~/weekly-photo-selector/selected_photos"
+OUTPUT_DIR = "~/weekly-photo-selector/selections_metadata"  # Store selection metadata only
 LOG_FILE = "~/weekly-photo-selector/photo_selector.log"
 PRINTER_NAME = "Canon_PIXMA_G620"  # Adjust based on your printer setup
 MAX_PHOTOS_TO_SELECT = 5  # Number of photos to select and print
+
+# Family Photo Rating Configuration
+FAMILY_PHOTO_FOCUS = True  # Set to False for general photo selection
+MIN_FAMILY_SCORE = 6       # Minimum score to consider for family photos
+PREFER_MULTIPLE_PEOPLE = True  # Boost scores for photos with multiple family members
+BOOST_CHILDREN_PHOTOS = True   # Give extra points to photos with children
 
 # Setup logging
 logging.basicConfig(
@@ -162,7 +168,7 @@ class PhotoSelector:
             return None
     
     def rate_photo_with_ollama(self, image_path: Path) -> Dict:
-        """Use Ollama to rate and analyze a photo."""
+        """Use Ollama to rate and analyze a photo with family-focused criteria."""
         if not self.selected_model:
             return {"score": 5, "reasoning": "No model available"}
             
@@ -170,20 +176,11 @@ class PhotoSelector:
         if not base64_image:
             return {"score": 0, "reasoning": "Failed to encode image"}
         
-        prompt = """Rate this photo on a scale of 1-10 for printing quality and emotional impact. Consider:
-        1. Technical quality (focus, exposure, composition)
-        2. Emotional impact and memorability
-        3. Print worthiness (how good it would look printed)
-        4. Uniqueness and interest
-        
-        Respond with JSON format:
-        {
-            "score": <number 1-10>,
-            "reasoning": "<brief explanation>",
-            "technical_quality": <1-10>,
-            "emotional_impact": <1-10>,
-            "print_worthiness": <1-10>
-        }"""
+        # Use family-focused prompt if enabled
+        if FAMILY_PHOTO_FOCUS:
+            prompt = self._get_family_photo_prompt()
+        else:
+            prompt = self._get_general_photo_prompt()
         
         try:
             response = requests.post(
@@ -202,6 +199,11 @@ class PhotoSelector:
                 result = response.json()
                 try:
                     rating = json.loads(result['response'])
+                    
+                    # Apply family-specific scoring adjustments
+                    if FAMILY_PHOTO_FOCUS:
+                        rating = self._apply_family_scoring_boost(rating, result.get('response', ''))
+                    
                     logger.info(f"Rated {image_path.name}: {rating.get('score', 'N/A')}/10")
                     return rating
                 except json.JSONDecodeError as e:
@@ -220,16 +222,214 @@ class PhotoSelector:
             logger.error(f"Error rating photo {image_path}: {e}")
             return {"score": 5, "reasoning": f"Error: {str(e)}"}
     
+    def _get_family_photo_prompt(self) -> str:
+        """Get the family-focused rating prompt."""
+        return """Rate this photo on a scale of 1-10 for family memory value and printing quality. Consider:
+        1. Family content and emotional significance:
+           - Clear faces of family members (especially children)
+           - Genuine emotions, smiles, laughter, or meaningful expressions
+           - Family interactions, bonding moments, milestones
+           - Special occasions, holidays, vacations, everyday precious moments
+        2. Memory worthiness:
+           - Will this be treasured in 5-10 years?
+           - Does it capture personality or a special moment in time?
+           - Is it the kind of photo you'd put in a family album?
+        3. Print quality:
+           - Good focus and lighting on faces
+           - Composition that works well for physical printing
+           - Not blurry, overexposed, or technically poor
+        4. Prioritize over generic content:
+           - Family photos > landscape/object photos
+           - Candid moments > posed shots (unless special occasions)
+           - Multiple family members > solo shots (unless very special)
+           
+        Give LOWER scores (1-4) to:
+        - Photos without clear family members
+        - Blurry faces or poor lighting on people
+        - Screenshots, memes, or non-memorable content
+        - Generic landscape/food photos without family context
+        
+        Give HIGHER scores (7-10) to:
+        - Clear, well-lit photos of family members
+        - Emotional moments, celebrations, milestones
+        - Photos that capture personality and relationships
+        - Images that tell a family story
+        
+        Respond with JSON format:
+        {
+            "score": <number 1-10>,
+            "reasoning": "<brief explanation focusing on family memory value>",
+            "family_content": <1-10>,
+            "emotional_impact": <1-10>,
+            "print_quality": <1-10>,
+            "memory_worthiness": <1-10>
+        }"""
+    
+    def _get_general_photo_prompt(self) -> str:
+        """Get the general photo rating prompt."""
+        return """Rate this photo on a scale of 1-10 for printing quality and emotional impact. Consider:
+        1. Technical quality (focus, exposure, composition)
+        2. Emotional impact and memorability
+        3. Print worthiness (how good it would look printed)
+        4. Uniqueness and interest
+        
+        Respond with JSON format:
+        {
+            "score": <number 1-10>,
+            "reasoning": "<brief explanation>",
+            "technical_quality": <1-10>,
+            "emotional_impact": <1-10>,
+            "print_worthiness": <1-10>
+        }"""
+    
+    def _apply_family_scoring_boost(self, rating: Dict, raw_response: str) -> Dict:
+        """Apply family-specific scoring boosts based on configuration."""
+        base_score = rating.get('score', 5)
+        family_content = rating.get('family_content', 5)
+        
+        # Apply minimum family score filter
+        if family_content < MIN_FAMILY_SCORE:
+            logger.debug(f"Photo scored low on family content ({family_content}), reducing overall score")
+            rating['score'] = min(base_score, 4)  # Cap at 4 for non-family content
+            return rating
+        
+        boost = 0
+        boost_reasons = []
+        
+        # Boost for multiple people (family interactions)
+        if PREFER_MULTIPLE_PEOPLE:
+            response_lower = raw_response.lower()
+            if any(phrase in response_lower for phrase in ['multiple people', 'family members', 'group', 'together']):
+                boost += 1
+                boost_reasons.append("multiple family members")
+        
+        # Boost for children
+        if BOOST_CHILDREN_PHOTOS:
+            response_lower = raw_response.lower()
+            if any(phrase in response_lower for phrase in ['child', 'children', 'kid', 'baby', 'toddler']):
+                boost += 1
+                boost_reasons.append("children present")
+        
+        # Apply boost but cap at 10
+        if boost > 0:
+            new_score = min(base_score + boost, 10)
+            rating['score'] = new_score
+            boost_text = f" (boosted +{boost} for: {', '.join(boost_reasons)})"
+            rating['reasoning'] += boost_text
+            logger.debug(f"Applied family boost: {boost_reasons}")
+        
+        return rating
+    
+    def select_top_photos(self, weekly_photos: List[Path]) -> List[Tuple[Path, Dict]]:
+        """Rate all photos and select the top ones based on AI scoring."""
+        if not weekly_photos:
+            return []
+        
+        logger.info(f"Rating {len(weekly_photos)} photos with AI...")
+        rated_photos = []
+        
+        for i, photo_path in enumerate(weekly_photos):
+            logger.info(f"Processing photo {i+1}/{len(weekly_photos)}: {photo_path.name}")
+            
+            try:
+                rating = self.rate_photo_with_ollama(photo_path)
+                score = rating.get('score', 0)
+                
+                if score > 0:  # Only include photos with valid scores
+                    rated_photos.append((photo_path, rating))
+                    logger.debug(f"Added {photo_path.name} with score {score}")
+                else:
+                    logger.warning(f"Skipping {photo_path.name} due to low/invalid score: {score}")
+                    
+            except Exception as e:
+                logger.error(f"Error rating {photo_path.name}: {e}")
+                continue
+            
+            # Small delay to be nice to the AI service
+            time.sleep(0.5)
+        
+        if not rated_photos:
+            logger.warning("No photos received valid ratings")
+            return []
+        
+        # Sort by score (highest first) and take top N
+        sorted_photos = sorted(rated_photos, key=lambda x: x[1].get('score', 0), reverse=True)
+        top_photos = sorted_photos[:MAX_PHOTOS_TO_SELECT]
+        
+        logger.info(f"Selected top {len(top_photos)} photos:")
+        for i, (photo_path, rating) in enumerate(top_photos, 1):
+            score = rating.get('score', 'N/A')
+            reasoning = rating.get('reasoning', 'No reasoning provided')
+            logger.info(f"  {i}. {photo_path.name} - Score: {score}/10")
+            logger.info(f"     Reasoning: {reasoning}")
+        
+        return top_photos
+    
+    def copy_selected_photos(self, selected_photos: List[Tuple[Path, Dict]]) -> List[Path]:
+        """Save selection metadata and return original photo paths for direct printing."""
+        if not selected_photos:
+            return []
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        photo_paths = []
+        
+        # Create a summary file with all selections
+        summary_file = self.output_dir / f"selection_{timestamp}.json"
+        selections_summary = {
+            'selection_date': timestamp,
+            'week_range': f"{self.get_week_range()[0].strftime('%Y-%m-%d')} to {self.get_week_range()[1].strftime('%Y-%m-%d')}",
+            'total_photos_evaluated': len(selected_photos),
+            'selected_photos': []
+        }
+        
+        logger.info(f"Preparing {len(selected_photos)} photos for direct printing from Synology:")
+        
+        for i, (photo_path, rating) in enumerate(selected_photos, 1):
+            try:
+                score = rating.get('score', 'unknown')
+                reasoning = rating.get('reasoning', 'No reasoning provided')
+                
+                # Add to summary
+                photo_info = {
+                    'rank': i,
+                    'original_path': str(photo_path),
+                    'filename': photo_path.name,
+                    'rating': rating
+                }
+                selections_summary['selected_photos'].append(photo_info)
+                
+                # Keep original path for direct printing
+                photo_paths.append(photo_path)
+                
+                logger.info(f"Rank {i}: {photo_path.name} (Score: {score}/10)")
+                logger.info(f"    Path: {photo_path}")
+                logger.info(f"    Reasoning: {reasoning}")
+                
+            except Exception as e:
+                logger.error(f"Error processing {photo_path}: {e}")
+                continue
+        
+        # Save selection summary
+        try:
+            with open(summary_file, 'w') as f:
+                json.dump(selections_summary, f, indent=2)
+            logger.info(f"Selection metadata saved to: {summary_file}")
+        except Exception as e:
+            logger.warning(f"Could not save selection metadata: {e}")
+        
+        logger.info(f"Ready to print {len(photo_paths)} photos directly from Synology NAS")
+        return photo_paths
+
     def print_photos(self, photo_paths: List[Path]):
-        """Print the selected photos."""
+        """Print the selected photos directly from their original locations."""
         if not photo_paths:
             logger.warning("No photos to print")
             return
             
         if self.test_mode:
-            logger.info(f"TEST MODE: Would print {len(photo_paths)} photos:")
-            for photo_path in photo_paths:
-                logger.info(f"  - {photo_path.name}")
+            logger.info(f"TEST MODE: Would print {len(photo_paths)} photos directly from Synology:")
+            for i, photo_path in enumerate(photo_paths, 1):
+                logger.info(f"  {i}. {photo_path}")
             return
         
         # Check if printer is available
@@ -238,31 +438,41 @@ class PhotoSelector:
                                   capture_output=True, text=True)
             if result.returncode != 0:
                 logger.warning(f"Printer '{PRINTER_NAME}' not found or not configured")
-                logger.info(f"Photos are saved in: {self.output_dir}")
+                logger.info(f"Selection metadata saved in: {self.output_dir}")
                 logger.info("Run setup_canon_printer.sh after you get your Canon PIXMA G620")
                 return
         except Exception as e:
             logger.warning(f"Could not check printer status: {e}")
-            logger.info("Skipping printing - photos are saved for when printer is available")
+            logger.info("Skipping printing - selection metadata is saved for when printer is available")
             return
         
-        logger.info(f"Printing {len(photo_paths)} photos on {PRINTER_NAME}...")
+        logger.info(f"Printing {len(photo_paths)} photos directly from Synology on {PRINTER_NAME}...")
         
-        for photo_path in photo_paths:
+        for i, photo_path in enumerate(photo_paths, 1):
             try:
-                # Use lpr to print (standard Unix printing command)
+                logger.info(f"Printing photo {i}/{len(photo_paths)}: {photo_path.name}")
+                
+                # Verify file still exists and is accessible
+                if not photo_path.exists():
+                    logger.error(f"Photo no longer exists: {photo_path}")
+                    continue
+                
+                # Use lpr to print directly from network location
                 cmd = ["lpr", "-P", PRINTER_NAME, str(photo_path)]
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 
                 if result.returncode == 0:
-                    logger.info(f"Successfully printed: {photo_path.name}")
+                    logger.info(f"✓ Successfully sent to printer: {photo_path.name}")
                 else:
-                    logger.error(f"Failed to print {photo_path.name}: {result.stderr}")
+                    logger.error(f"✗ Failed to print {photo_path.name}: {result.stderr}")
+                    # Log the full path for troubleshooting
+                    logger.error(f"  Full path: {photo_path}")
                     
             except Exception as e:
                 logger.error(f"Error printing {photo_path}: {e}")
         
-        logger.info("Printing jobs submitted to printer queue")
+        logger.info("Print jobs submitted to printer queue")
+        logger.info("Photos printed directly from Synology NAS - no local storage used")
     
     def run(self):
         """Main execution method."""

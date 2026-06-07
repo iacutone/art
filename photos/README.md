@@ -1,14 +1,16 @@
 # Weekly Photo Selector & Printer
 
-An AI-powered system that automatically selects the best photos from your collection each week and prints them on your Canon PIXMA G620.
+An AI-powered system that automatically selects the best photos from your Synology NAS each week and prints them directly on your Canon PIXMA G620.
 
 ## System Overview
 
 This system uses computer vision AI to:
-1. **Scan** your photo directories for pictures from the past week
+1. **Scan** your Synology photo directories for pictures from the past week
 2. **Analyze** each photo for technical quality and emotional impact
 3. **Select** the top 5 photos based on AI ratings
-4. **Print** them automatically every Sunday at 10 PM EST
+4. **Print** them directly from the NAS every Sunday at 10 PM EST
+
+**Key Feature**: Photos are printed directly from your Synology NAS without copying to local storage, saving disk space and maintaining organization.
 
 ## Setup Instructions
 
@@ -72,13 +74,52 @@ PHOTO_DIRS = [
 ]
 ```
 
+### Family Photo Customization
+Adjust family photo selection behavior by editing these settings in `select_and_print_photos.py`:
+
+```python
+# Family Photo Rating Configuration
+FAMILY_PHOTO_FOCUS = True      # Enable family-focused rating (vs general photos)
+MIN_FAMILY_SCORE = 6           # Minimum family content score (1-10)
+PREFER_MULTIPLE_PEOPLE = True  # Boost scores for group/interaction photos
+BOOST_CHILDREN_PHOTOS = True   # Give extra points to photos with children
+MAX_PHOTOS_TO_SELECT = 5       # Number of photos to print each week
+```
+
+**Customization Options:**
+- **Turn off family focus**: Set `FAMILY_PHOTO_FOCUS = False` for general photo selection
+- **Stricter family filtering**: Increase `MIN_FAMILY_SCORE` to 7 or 8
+- **More photos**: Increase `MAX_PHOTOS_TO_SELECT` to 7 or 10
+- **Disable boosts**: Set boost options to `False` for pure AI scoring
+
 ### Selection Criteria
-- **Maximum photos per week**: 5 (configurable)
-- **Rating scale**: 1-10 based on:
-  - Technical quality (focus, exposure, composition)
-  - Emotional impact and memorability
-  - Print worthiness
-  - Uniqueness and interest
+The AI evaluates each photo on a **1-10 scale** optimized for **family memories**:
+
+**Primary Focus (Family Photos):**
+- **Family content** (clear faces, especially children)
+- **Emotional significance** (genuine moments, milestones, celebrations)
+- **Memory worthiness** (will this be treasured in 5-10 years?)
+- **Print quality** (good focus and lighting on faces)
+
+**Scoring Priority:**
+- **High scores (7-10)**: Clear family photos, emotional moments, special occasions
+- **Medium scores (5-6)**: Decent family photos with minor technical issues
+- **Low scores (1-4)**: Non-family content, blurry faces, screenshots, generic landscapes
+
+**Smart Boosting:**
+- **+1 point** for photos with multiple family members (interactions)
+- **+1 point** for photos featuring children
+- **Minimum family score threshold**: Photos must score ≥6 on family content
+
+**Selection process:**
+1. Scans Synology directories for images from the past week
+2. Rates each photo using family-focused AI criteria
+3. Applies smart scoring boosts for family interactions and children
+4. Selects **top 5 highest-scoring family photos** for printing
+5. Saves selection metadata with detailed reasoning
+
+**Output naming:** Selection metadata saved as `selection_YYYYMMDD_HHMMSS.json`
+**Storage efficiency:** Photos remain on Synology NAS, only metadata stored locally
 
 ## File Structure
 
@@ -87,7 +128,7 @@ PHOTO_DIRS = [
 ├── select_and_print_photos.py  # Main selection script
 ├── run_weekly_selection.sh     # Cron job runner
 ├── test_selection.sh           # Manual test runner
-├── selected_photos/            # Weekly selections
+├── selections_metadata/        # Selection history (JSON files only)
 └── logs/                      # System logs
 ```
 
