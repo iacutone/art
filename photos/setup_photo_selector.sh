@@ -1,142 +1,157 @@
 #!/bin/bash
+# Weekly Photo Selector setup: installs the scripts into ~/weekly-photo-selector,
+# creates a Python virtualenv, pulls a vision model and schedules the weekly
+# run with launchd (Sundays at 10 PM local time).
 
-# Weekly Photo Selector Setup Script
-# This script sets up the automated photo selection and printing system
+set -euo pipefail
 
-set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SYSTEM_DIR="$HOME/weekly-photo-selector"
+VENV="$SYSTEM_DIR/venv"
+LABEL="com.weekly-photo-selector"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+VISION_MODEL="llama3.2-vision:latest"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 echo "🖼️  Setting up Weekly Photo Selector System..."
 
-# Create directories
-SYSTEM_DIR="$HOME/weekly-photo-selector"
-mkdir -p "$SYSTEM_DIR/selections_metadata"
-mkdir -p "$SYSTEM_DIR/logs"
+mkdir -p "$SYSTEM_DIR/selections_metadata" "$SYSTEM_DIR/logs"
+cp "$SCRIPT_DIR/select_and_print_photos.py" \
+   "$SCRIPT_DIR/ollama_client.py" \
+   "$SCRIPT_DIR/test_photo_rating.py" \
+   "$SCRIPT_DIR/requirements.txt" \
+   "$SYSTEM_DIR/"
+echo "📋 Copied scripts to $SYSTEM_DIR"
 
-echo "📁 Created system directories in $SYSTEM_DIR"
-
-# Copy script to system directory
-cp select_and_print_photos.py "$SYSTEM_DIR/"
-cp requirements.txt "$SYSTEM_DIR/"
-chmod +x "$SYSTEM_DIR/select_and_print_photos.py"
-
-echo "📋 Copied scripts to system directory"
-
-# Install Python dependencies
-echo "🐍 Installing Python dependencies..."
-pip3 install -r requirements.txt
-
-# Check if Ollama is running
-echo "🤖 Checking Ollama service..."
-if ! pgrep -x "ollama" > /dev/null; then
-    echo "⚠️  Ollama is not running. Starting Ollama service..."
-    ollama serve &
-    sleep 5
-fi
-
-# Verify Ollama model is available
-echo "🧠 Verifying Ollama model availability..."
-if ! ollama list | grep -q "llama3.2:latest"; then
-    echo "📥 Downloading llama3.2:latest model for vision capabilities..."
-    ollama pull llama3.2-vision:latest || ollama pull llama3.2:latest
-fi
-
-# Check printer setup
-echo "🖨️  Checking printer setup..."
-if lpstat -p | grep -q "Canon"; then
-    echo "✅ Canon printer found"
-    PRINTER_NAME=$(lpstat -p | grep Canon | head -n1 | awk '{print $2}')
-    echo "Detected printer: $PRINTER_NAME"
-    
-    # Update the printer name in the script
-    sed -i.bak "s/PRINTER_NAME = \"Canon_PIXMA_G620\"/PRINTER_NAME = \"$PRINTER_NAME\"/" "$SYSTEM_DIR/select_and_print_photos.py"
+# Write a starter config only if there isn't one, so re-running setup keeps your settings.
+if [ ! -f "$SYSTEM_DIR/config.json" ]; then
+    cat > "$SYSTEM_DIR/config.json" << 'EOF'
+{
+  "photo_dirs": ["~/nas-home/Photos/MobileBackup", "~/nas-home/Photos/phockup"],
+  "max_photos_to_select": 5,
+  "print_options": {"media": "na_index-4x6_4x6in"}
+}
+EOF
+    echo "📝 Created $SYSTEM_DIR/config.json"
 else
-    echo "ℹ️  Canon PIXMA G620 not found (not yet purchased)"
-    echo "The system will work in selection mode and save photos to the output directory."
-    echo "After you get your printer, run the printer setup script to enable printing."
+    echo "📝 Keeping existing $SYSTEM_DIR/config.json"
 fi
 
-# Create the cron job script
+echo "🐍 Creating virtualenv and installing Python dependencies..."
+python3 -m venv "$VENV"
+"$VENV/bin/pip" install --quiet --upgrade pip
+"$VENV/bin/pip" install --quiet -r "$SYSTEM_DIR/requirements.txt"
+
+echo "🤖 Checking Ollama..."
+if ! command -v ollama > /dev/null; then
+    echo "❌ Ollama is not installed. Install it with: brew install ollama"
+    echo "   Then re-run this script."
+    exit 1
+fi
+if ! curl -sf http://localhost:11434/api/tags > /dev/null; then
+    echo "   Starting Ollama..."
+    ollama serve > "$SYSTEM_DIR/logs/ollama.log" 2>&1 &
+    for _ in $(seq 1 15); do
+        curl -sf http://localhost:11434/api/tags > /dev/null && break
+        sleep 1
+    done
+fi
+if ! ollama list | grep -q "^${VISION_MODEL%:latest}"; then
+    echo "📥 Downloading $VISION_MODEL (several GB)..."
+    ollama pull "$VISION_MODEL"
+fi
+
+# Runner used by launchd and for manual runs. Pass --test to skip printing.
 cat > "$SYSTEM_DIR/run_weekly_selection.sh" << 'EOF'
 #!/bin/bash
+# launchd has a minimal PATH; include Homebrew on both Apple Silicon and Intel.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+SYSTEM_DIR="$HOME/weekly-photo-selector"
+cd "$SYSTEM_DIR" || exit 1
 
-# Weekly Photo Selection Cron Job Runner
-# Runs every Sunday at 10 PM EST
+echo "=== Starting weekly photo selection at $(date)"
 
-export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
-
-# Set timezone to EST
-export TZ="America/New_York"
-
-# Log file with timestamp
-LOG_FILE="$HOME/weekly-photo-selector/logs/cron_$(date +%Y%m%d_%H%M%S).log"
-
-echo "Starting weekly photo selection at $(date)" >> "$LOG_FILE"
-
-# Ensure Ollama is running
-if ! pgrep -x "ollama" > /dev/null; then
-    echo "Starting Ollama service..." >> "$LOG_FILE"
-    ollama serve >> "$LOG_FILE" 2>&1 &
-    sleep 10
+if ! curl -sf http://localhost:11434/api/tags > /dev/null; then
+    echo "Starting Ollama..."
+    ollama serve >> "$SYSTEM_DIR/logs/ollama.log" 2>&1 &
+    for _ in $(seq 1 30); do
+        curl -sf http://localhost:11434/api/tags > /dev/null && break
+        sleep 1
+    done
 fi
 
-# Run the photo selection script
-cd "$HOME/weekly-photo-selector"
-python3 select_and_print_photos.py >> "$LOG_FILE" 2>&1
-
-echo "Completed weekly photo selection at $(date)" >> "$LOG_FILE"
+"$SYSTEM_DIR/venv/bin/python" select_and_print_photos.py "$@"
+status=$?
+echo "=== Finished at $(date) with exit code $status"
+exit $status
 EOF
-
 chmod +x "$SYSTEM_DIR/run_weekly_selection.sh"
 
-echo "📅 Created cron job runner script"
-
-# Create the cron job entry
-CRON_ENTRY="0 22 * * 0 $SYSTEM_DIR/run_weekly_selection.sh"
-
-# Check if cron job already exists
-if crontab -l 2>/dev/null | grep -q "run_weekly_selection.sh"; then
-    echo "⚠️  Cron job already exists"
-else
-    # Add cron job
-    (crontab -l 2>/dev/null; echo "$CRON_ENTRY") | crontab -
-    echo "⏰ Added cron job: Every Sunday at 10:00 PM EST"
-fi
-
-# Create a test runner script
 cat > "$SYSTEM_DIR/test_selection.sh" << 'EOF'
 #!/bin/bash
+# Run the full selection without printing.
+exec "$HOME/weekly-photo-selector/run_weekly_selection.sh" --test
+EOF
+chmod +x "$SYSTEM_DIR/test_selection.sh"
+echo "📋 Created run_weekly_selection.sh and test_selection.sh"
 
-# Test script to run photo selection manually
-echo "🧪 Running photo selection test..."
-
-cd "$HOME/weekly-photo-selector"
-
-# Ensure Ollama is running
-if ! pgrep -x "ollama" > /dev/null; then
-    echo "Starting Ollama service..."
-    ollama serve &
-    sleep 10
+# Remove the cron entry older versions of this script installed.
+if crontab -l 2>/dev/null | grep -q "run_weekly_selection.sh"; then
+    { crontab -l 2>/dev/null | grep -v "run_weekly_selection.sh" || true; } | crontab -
+    echo "🧹 Removed old cron entry (replaced by launchd)"
 fi
 
-# Run with test mode (don't actually print)
-python3 select_and_print_photos.py --test
+# launchd runs a missed job when the Mac wakes, unlike cron.
+mkdir -p "$HOME/Library/LaunchAgents"
+cat > "$PLIST" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$SYSTEM_DIR/run_weekly_selection.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>22</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>$SYSTEM_DIR/logs/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>$SYSTEM_DIR/logs/launchd.log</string>
+</dict>
+</plist>
 EOF
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
+echo "⏰ Scheduled with launchd: Sundays at 10:00 PM local time"
 
-chmod +x "$SYSTEM_DIR/test_selection.sh"
+if lpstat -p 2>/dev/null | grep -qi canon; then
+    echo "🖨️  A Canon printer is configured. Run ./setup_canon_printer.sh to link it to the selector."
+else
+    echo "🖨️  No printer configured yet. Run ./setup_canon_printer.sh next."
+fi
 
-echo "✅ Setup completed successfully!"
 echo ""
-echo "📋 Summary:"
-echo "   • System installed in: $SYSTEM_DIR"
-echo "   • Cron job scheduled: Every Sunday at 10:00 PM EST"
-echo "   • Log files saved in: $SYSTEM_DIR/logs/"
-echo "   • Selection metadata saved in: $SYSTEM_DIR/selections_metadata/"
+echo "✅ Setup completed!"
+echo "   • Installed in:      $SYSTEM_DIR"
+echo "   • Settings:          $SYSTEM_DIR/config.json"
+echo "   • Logs:              $SYSTEM_DIR/logs/"
+echo "   • Selection history: $SYSTEM_DIR/selections_metadata/"
 echo ""
-echo "🧪 To test the system manually, run:"
-echo "   $SYSTEM_DIR/test_selection.sh"
+echo "Next steps:"
+echo "   1. ./setup_canon_printer.sh"
+echo "   2. $SYSTEM_DIR/venv/bin/python $SYSTEM_DIR/test_photo_rating.py"
+echo "   3. $SYSTEM_DIR/test_selection.sh"
 echo ""
-echo "📝 To view/edit cron jobs:"
-echo "   crontab -e"
-echo ""
-echo "📊 To view logs:"
-echo "   tail -f $SYSTEM_DIR/logs/*.log"
+echo "⚠️  The NAS share must be mounted at ~/nas-home when the job runs."
+echo "   If the scan can't read it, give /bin/bash Full Disk Access in"
+echo "   System Settings > Privacy & Security."
