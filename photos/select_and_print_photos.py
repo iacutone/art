@@ -2,15 +2,17 @@
 """
 Weekly Photo Selector and Printer
 
-Finds photos taken in the past week on the NAS, rates them with a local
-Ollama vision model, and prints the best ones on the Canon PIXMA G620.
+Finds photos taken in the past week in Synology Photos on the NAS (the
+default) or Amazon Photos, rates them with a local Ollama vision model, and
+prints the best ones on the Canon PIXMA G620.
 
 Settings live in ~/weekly-photo-selector/config.json (see DEFAULT_CONFIG);
-any key left out uses the default below.
+any key left out uses the default below. Environment variables, or the same
+KEY=value lines in ~/weekly-photo-selector/photo-selector.env, override
+config.json (see ENV_OVERRIDES).
 """
 
 import argparse
-import hashlib
 import json
 import logging
 import os
@@ -18,19 +20,49 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
 
-from ollama_client import HEIF_SUPPORTED, OllamaClient, OllamaError, encode_image_base64
+from ollama_client import OllamaClient, OllamaError, encode_image_base64
+from photo_sources import SOURCES, Photo, PhotoSourceError, make_source
 
 SYSTEM_DIR = Path.home() / "weekly-photo-selector"
+ENV_FILE = Path(os.environ.get("PHOTO_SELECTOR_ENV", SYSTEM_DIR / "photo-selector.env"))
+
+
+def load_env_file(path: Path) -> None:
+    """Read KEY=value lines into os.environ. Variables already set in the environment win.
+
+    Parsed here rather than sourced by the shell, so values such as Amazon's
+    "Atza|..." cookie need no quoting.
+    """
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if value:
+            os.environ.setdefault(key.strip(), value)
+
+
+load_env_file(ENV_FILE)
 CONFIG_PATH = Path(os.environ.get("PHOTO_SELECTOR_CONFIG", SYSTEM_DIR / "config.json"))
 
 DEFAULT_CONFIG = {
+    # "synology" (Synology Photos folders on the NAS) or "amazon" (Amazon Photos).
+    "photo_source": "synology",
+    # Sign-in cookies copied from a browser signed in to Amazon Photos (see README).
+    # "cookies" (a dict of cookie name -> value), when set, is used instead of the file.
+    "amazon_photos": {"cookies_file": str(SYSTEM_DIR / "amazon_cookies.json"), "cookies": None},
+    # Synology Photos folders on the mounted NAS, used when photo_source is "synology".
     "photo_dirs": ["~/nas-home/Photos/MobileBackup", "~/nas-home/Photos/phockup"],
     # Tried in order; only models that can actually see images are listed.
     "vision_models": ["llama3.2-vision:latest", "llava:latest"],
@@ -53,27 +85,54 @@ DEFAULT_CONFIG = {
     "skip_previously_printed": True,
 }
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif"}
-
-# EXIF tag ids
-EXIF_IFD = 0x8769
-TAG_DATETIME_ORIGINAL = 36867
-TAG_DATETIME_DIGITIZED = 36868
-TAG_DATETIME = 306
-
 logger = logging.getLogger("photo_selector")
 
+# Environment variables that override config.json. Set them in the shell or
+# in photo-selector.env.
+ENV_OVERRIDES = {
+    "PHOTO_SELECTOR_SOURCE": "photo_source: synology or amazon",
+    "PHOTO_SELECTOR_PRINTER": "printer_name",
+    "SYNOLOGY_PHOTO_DIRS": "photo_dirs, separated by ':'",
+    "AMAZON_PHOTOS_SESSION_ID": "the session-id cookie",
+    "AMAZON_PHOTOS_UBID": "the ubid-main (or ubid-acb<region>) cookie",
+    "AMAZON_PHOTOS_AT": "the at-main (or at-acb<region>) cookie",
+    "AMAZON_PHOTOS_REGION": "com (default) for amazon.com, else the cookie suffix, e.g. ca, uk, de",
+    "AMAZON_PHOTOS_COOKIES_FILE": "amazon_photos.cookies_file, used when the cookie variables aren't set",
+}
+AMAZON_COOKIE_VARS = ("AMAZON_PHOTOS_SESSION_ID", "AMAZON_PHOTOS_UBID", "AMAZON_PHOTOS_AT")
 
-@dataclass
-class Photo:
-    path: Path
-    taken: datetime
-    sha256: str = ""
-    rating: Dict = field(default_factory=dict)
 
-    @property
-    def score(self) -> int:
-        return self.rating.get("score", 0)
+def amazon_cookies_from_env() -> Optional[Dict[str, str]]:
+    present = [v for v in AMAZON_COOKIE_VARS if os.environ.get(v)]
+    if not present:
+        return None
+    missing = [v for v in AMAZON_COOKIE_VARS if v not in present]
+    if missing:
+        raise ValueError(f"Set all of {', '.join(AMAZON_COOKIE_VARS)}; missing {', '.join(missing)}")
+    region = os.environ.get("AMAZON_PHOTOS_REGION", "com").strip().lower()
+    suffix = "main" if region == "com" else f"acb{region}"
+    return {
+        "session-id": os.environ["AMAZON_PHOTOS_SESSION_ID"],
+        f"ubid-{suffix}": os.environ["AMAZON_PHOTOS_UBID"],
+        f"at-{suffix}": os.environ["AMAZON_PHOTOS_AT"],
+    }
+
+
+def apply_env_overrides(config: dict) -> None:
+    env = os.environ
+    if env.get("PHOTO_SELECTOR_SOURCE"):
+        config["photo_source"] = env["PHOTO_SELECTOR_SOURCE"].strip().lower()
+    if env.get("PHOTO_SELECTOR_PRINTER"):
+        config["printer_name"] = env["PHOTO_SELECTOR_PRINTER"]
+    if env.get("SYNOLOGY_PHOTO_DIRS"):
+        config["photo_dirs"] = [d for d in env["SYNOLOGY_PHOTO_DIRS"].split(":") if d.strip()]
+    amazon = dict(config["amazon_photos"])
+    if env.get("AMAZON_PHOTOS_COOKIES_FILE"):
+        amazon["cookies_file"] = env["AMAZON_PHOTOS_COOKIES_FILE"]
+    cookies = amazon_cookies_from_env()
+    if cookies:
+        amazon["cookies"] = cookies
+    config["amazon_photos"] = amazon
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict:
@@ -90,8 +149,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
                 config[key] = {**DEFAULT_CONFIG[key], **value}
             else:
                 config[key] = value
-    if os.environ.get("PHOTO_SELECTOR_PRINTER"):
-        config["printer_name"] = os.environ["PHOTO_SELECTOR_PRINTER"]
+    apply_env_overrides(config)
     return config
 
 
@@ -198,73 +256,14 @@ class PhotoSelector:
         week_start = week_end - timedelta(days=7)
         return week_start, week_end
 
-    @staticmethod
-    def get_image_date(image_path: Path) -> datetime:
-        """Capture date from EXIF (DateTimeOriginal preferred), else file mtime."""
-        try:
-            with Image.open(image_path) as img:
-                exif = img.getexif()
-                sub = exif.get_ifd(EXIF_IFD)
-                for value in (
-                    sub.get(TAG_DATETIME_ORIGINAL),
-                    sub.get(TAG_DATETIME_DIGITIZED),
-                    exif.get(TAG_DATETIME),
-                ):
-                    if value:
-                        return datetime.strptime(str(value).strip("\x00 "), "%Y:%m:%d %H:%M:%S")
-        except Exception as e:
-            logger.debug(f"No usable EXIF date in {image_path}: {e}")
-        return datetime.fromtimestamp(image_path.stat().st_mtime)
-
-    @staticmethod
-    def file_hash(path: Path) -> str:
-        digest = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-
-    def collect_weekly_photos(self) -> List[Photo]:
-        """Photos taken during the week, with exact duplicates across folders removed."""
+    def collect_weekly_photos(self, workdir: Path) -> List[Photo]:
+        """Photos taken during the week, with exact duplicates removed."""
+        source = make_source(self.config)
         logger.info(
             f"Selecting photos from {self.week_start:%Y-%m-%d} to "
-            f"{self.week_end - timedelta(days=1):%Y-%m-%d}"
+            f"{self.week_end - timedelta(days=1):%Y-%m-%d} in {source.name}"
         )
-        if not HEIF_SUPPORTED:
-            logger.warning("pillow-heif not installed: HEIC photos will be skipped")
-
-        start_ts = self.week_start.timestamp()
-        photos: List[Photo] = []
-        seen_hashes = set()
-
-        for photo_dir_str in self.config["photo_dirs"]:
-            photo_dir = Path(os.path.expanduser(photo_dir_str))
-            if not photo_dir.exists():
-                logger.warning(f"Photo directory does not exist (is the NAS mounted?): {photo_dir}")
-                continue
-            logger.info(f"Scanning {photo_dir}")
-
-            for image_path in photo_dir.rglob("*"):
-                if image_path.suffix.lower() not in IMAGE_EXTENSIONS or image_path.name.startswith("."):
-                    continue
-                try:
-                    # A file can't have been taken after it was last written, so
-                    # anything not modified this week can be skipped without
-                    # opening it over the network.
-                    if image_path.stat().st_mtime < start_ts:
-                        continue
-                    taken = self.get_image_date(image_path)
-                    if not (self.week_start <= taken < self.week_end):
-                        continue
-                    sha = self.file_hash(image_path)
-                    if sha in seen_hashes:
-                        logger.debug(f"Skipping duplicate {image_path}")
-                        continue
-                    seen_hashes.add(sha)
-                    photos.append(Photo(image_path, taken, sha))
-                except Exception as e:
-                    logger.warning(f"Error processing {image_path}: {e}")
-
+        photos = source.collect(self.week_start, self.week_end, workdir)
         logger.info(f"Found {len(photos)} unique photos from the past week")
         return photos
 
@@ -400,7 +399,7 @@ class PhotoSelector:
 
         logger.info(f"Selected top {len(selected)} photos:")
         for i, photo in enumerate(selected, 1):
-            logger.info(f"  {i}. {photo.path} - Score: {photo.score}/10")
+            logger.info(f"  {i}. {photo.origin} - Score: {photo.score}/10")
             logger.info(f"     Reasoning: {photo.rating.get('reasoning')}")
         return selected, len(rated)
 
@@ -410,6 +409,7 @@ class PhotoSelector:
         summary = {
             "selection_date": timestamp,
             "week_range": f"{self.week_start:%Y-%m-%d} to {self.week_end - timedelta(days=1):%Y-%m-%d}",
+            "photo_source": self.config["photo_source"],
             "model": self.model,
             "test_mode": self.test_mode,
             "total_photos_found": found,
@@ -417,8 +417,8 @@ class PhotoSelector:
             "selected_photos": [
                 {
                     "rank": i,
-                    "original_path": str(p.path),
-                    "filename": p.path.name,
+                    "original_path": p.origin,
+                    "filename": p.origin.rsplit("/", 1)[-1],
                     "taken": p.taken.isoformat(),
                     "sha256": p.sha256,
                     "rating": p.rating,
@@ -473,7 +473,7 @@ class PhotoSelector:
         if self.test_mode:
             logger.info(f"TEST MODE: would print {len(photos)} photos on {printer}:")
             for i, photo in enumerate(photos, 1):
-                logger.info(f"  {i}. {photo.path}")
+                logger.info(f"  {i}. {photo.origin}")
                 logger.info(f"     {' '.join(self.lpr_command(Path('<converted>.jpg'), photo.path.name))}")
             return []
 
@@ -516,7 +516,16 @@ class PhotoSelector:
             return 1
         logger.info(f"Using vision model: {self.model}")
 
-        photos = self.collect_weekly_photos()
+        # Amazon photos are downloaded here; it's removed once printing is done.
+        with tempfile.TemporaryDirectory(prefix="photo-selector-") as workdir:
+            try:
+                photos = self.collect_weekly_photos(Path(workdir))
+            except PhotoSourceError as e:
+                logger.error(str(e))
+                return 1
+            return self.select_and_print(photos)
+
+    def select_and_print(self, photos: List[Photo]) -> int:
         if not photos:
             logger.warning("No photos found for the past week")
             return 0
@@ -540,9 +549,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Weekly Photo Selector and Printer")
     parser.add_argument("--test", action="store_true", help="Select photos but don't print")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="Path to config.json")
+    parser.add_argument("--source", choices=SOURCES,
+                        help="Where to get photos: synology (Synology Photos on the NAS) or amazon "
+                             "(Amazon Photos). Overrides photo_source and PHOTO_SELECTOR_SOURCE; default synology.")
     args = parser.parse_args()
 
     config = load_config(args.config)
+    if args.source:
+        config["photo_source"] = args.source
+    if config["photo_source"] not in SOURCES:
+        parser.error(f"photo_source (config.json or PHOTO_SELECTOR_SOURCE) must be one of {', '.join(SOURCES)}, not {config['photo_source']!r}")
     setup_logging(Path(os.path.expanduser(config["log_dir"])))
     started = time.monotonic()
     code = PhotoSelector(config, test_mode=args.test).run()
